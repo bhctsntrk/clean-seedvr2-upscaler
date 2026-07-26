@@ -200,9 +200,40 @@ def cleanup_kind(info: os.stat_result) -> str:
     return "special"
 
 
+def same_cleanup_identity(
+    expected: os.stat_result,
+    current: os.stat_result,
+    kind: str,
+) -> bool:
+    if not os.path.samestat(expected, current):
+        return False
+
+    stable_fields = (
+        "st_birthtime_ns",
+        "st_file_attributes",
+        "st_reparse_tag",
+    )
+    for field in stable_fields:
+        if getattr(expected, field, None) != getattr(current, field, None):
+            return False
+
+    if stat.S_IFMT(expected.st_mode) != stat.S_IFMT(current.st_mode):
+        return False
+
+    # Removing children changes a directory's ctime, so directory identity
+    # relies on the filesystem ID plus creation/reparse metadata. Files and
+    # links can use the stronger mutation-sensitive fields as well.
+    if kind != "directory":
+        mutable_fields = ("st_ctime_ns", "st_mtime_ns", "st_size")
+        for field in mutable_fields:
+            if getattr(expected, field, None) != getattr(current, field, None):
+                return False
+    return True
+
+
 def verify_cleanup_entry(entry: CleanupEntry) -> os.stat_result:
     current = os.lstat(entry.path)
-    if not os.path.samestat(entry.identity, current):
+    if not same_cleanup_identity(entry.identity, current, entry.kind):
         raise RuntimeError(f"Cleanup path identity changed: {entry.path}")
     if cleanup_kind(current) != entry.kind:
         raise RuntimeError(f"Cleanup path type changed: {entry.path}")
@@ -259,7 +290,9 @@ def remove_manifest_entry(entry: CleanupEntry) -> None:
         if entry.kind == "link":
             raise
         os.chmod(entry.path, current.st_mode | stat.S_IWRITE)
-        verify_cleanup_entry(entry)
+        changed_mode = os.lstat(entry.path)
+        if not os.path.samestat(current, changed_mode):
+            raise RuntimeError(f"Cleanup path identity changed after chmod: {entry.path}")
         remove()
 
 
@@ -270,7 +303,7 @@ def remove_quarantined_tree(
     expected_marker: str,
 ) -> None:
     root_identity = os.lstat(root)
-    if not os.path.samestat(expected_root_identity, root_identity):
+    if not same_cleanup_identity(expected_root_identity, root_identity, "directory"):
         raise RuntimeError(f"Quarantined cleanup root identity changed: {root}")
     if cleanup_kind(root_identity) != "directory" or root.is_mount():
         raise RuntimeError(f"Quarantined cleanup root is not a plain directory: {root}")
@@ -329,7 +362,7 @@ def remove_temporary_environment(session: TemporaryEnvironment) -> None:
         container_identity = os.lstat(quarantine_container)
         os.rename(cleanup_root, quarantine)
         moved_identity = os.lstat(quarantine)
-        if not os.path.samestat(root_identity, moved_identity):
+        if not same_cleanup_identity(root_identity, moved_identity, "directory"):
             raise RuntimeError("Cleanup root identity changed during quarantine")
     else:
         container_identity = os.lstat(quarantine_container)
@@ -352,7 +385,11 @@ def remove_temporary_environment(session: TemporaryEnvironment) -> None:
                     expected_marker,
                 )
             current_container = os.lstat(quarantine_container)
-            if not os.path.samestat(container_identity, current_container):
+            if not same_cleanup_identity(
+                container_identity,
+                current_container,
+                "directory",
+            ):
                 raise RuntimeError("Cleanup quarantine container identity changed")
             if cleanup_kind(current_container) != "directory":
                 raise RuntimeError("Cleanup quarantine container type changed")
