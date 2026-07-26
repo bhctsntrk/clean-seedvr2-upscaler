@@ -200,6 +200,26 @@ def cleanup_kind(info: os.stat_result) -> str:
     return "special"
 
 
+def is_filesystem_boundary(
+    path: Path,
+    identity: os.stat_result | None = None,
+) -> bool:
+    """Detect roots and mount/volume boundaries without pathlib.is_mount()."""
+    parent = path.parent
+    if parent == path:
+        return True
+
+    current = identity if identity is not None else os.lstat(path)
+    parent_identity = os.lstat(parent)
+    if current.st_dev != parent_identity.st_dev:
+        return True
+
+    # POSIX filesystem roots have the same inode as their parent. Windows
+    # volume roots are covered by parent == path; junctions/reparse points are
+    # classified as links by cleanup_kind() and are never traversed.
+    return os.name != "nt" and current.st_ino == parent_identity.st_ino
+
+
 def same_cleanup_identity(
     expected: os.stat_result,
     current: os.stat_result,
@@ -242,6 +262,7 @@ def verify_cleanup_entry(entry: CleanupEntry) -> os.stat_result:
 
 def build_cleanup_manifest(root: Path, marker: Path) -> list[CleanupEntry]:
     manifest: list[CleanupEntry] = []
+    root_identity = os.lstat(root)
 
     def scan(directory: Path) -> None:
         with os.scandir(directory) as iterator:
@@ -262,8 +283,10 @@ def build_cleanup_manifest(root: Path, marker: Path) -> list[CleanupEntry]:
             kind = cleanup_kind(info)
             if kind == "special":
                 raise RuntimeError(f"Refusing to remove a special filesystem entry: {path}")
+            if info.st_dev != root_identity.st_dev:
+                raise RuntimeError(f"Refusing to cross a filesystem boundary: {path}")
             if kind == "directory":
-                if path.is_mount():
+                if is_filesystem_boundary(path, info):
                     raise RuntimeError(f"Refusing to cross a mounted filesystem: {path}")
                 scan(path)
             manifest.append(CleanupEntry(path=path, identity=info, kind=kind))
@@ -305,7 +328,10 @@ def remove_quarantined_tree(
     root_identity = os.lstat(root)
     if not same_cleanup_identity(expected_root_identity, root_identity, "directory"):
         raise RuntimeError(f"Quarantined cleanup root identity changed: {root}")
-    if cleanup_kind(root_identity) != "directory" or root.is_mount():
+    if cleanup_kind(root_identity) != "directory" or is_filesystem_boundary(
+        root,
+        root_identity,
+    ):
         raise RuntimeError(f"Quarantined cleanup root is not a plain directory: {root}")
 
     marker_identity = os.lstat(marker)

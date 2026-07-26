@@ -104,6 +104,42 @@ class InputOutputTests(unittest.TestCase):
 
 
 class CleanupTests(unittest.TestCase):
+    def test_cleanup_does_not_depend_on_path_is_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            with patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}):
+                session = MODULE.create_temporary_environment()
+                temporary = session.root / "temporary.bin"
+                temporary.write_bytes(b"temporary")
+                with patch.object(
+                    Path,
+                    "is_mount",
+                    side_effect=NotImplementedError("unsupported"),
+                ):
+                    MODULE.remove_temporary_environment(session)
+                self.assertFalse(session.root.exists())
+
+    def test_cleanup_fails_closed_at_filesystem_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            with patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}):
+                session = MODULE.create_temporary_environment()
+                protected = session.root / "protected.bin"
+                protected.write_bytes(b"keep me")
+                with patch.object(
+                    MODULE,
+                    "is_filesystem_boundary",
+                    return_value=True,
+                ):
+                    with self.assertRaises(RuntimeError):
+                        MODULE.remove_temporary_environment(session)
+
+                quarantine = session.parent / (
+                    f"{MODULE.QUARANTINE_PREFIX}{session.token}"
+                )
+                quarantined_file = quarantine / "session" / protected.name
+                self.assertEqual(quarantined_file.read_bytes(), b"keep me")
+                MODULE.remove_temporary_environment(session)
+                self.assertFalse(quarantine.exists())
+
     def test_session_redirects_caches_and_is_removed(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             with patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}):
