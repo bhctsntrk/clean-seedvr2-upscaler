@@ -23,6 +23,7 @@ import argparse
 import hashlib
 import os
 import re
+import secrets
 import shutil
 import stat
 import struct
@@ -48,12 +49,23 @@ SEEDVR2_ARCHIVE = f"{SEEDVR2_REPOSITORY}/archive/{SEEDVR2_REVISION}.zip"
 CUDA_WHEEL_INDEX = "https://download.pytorch.org/whl/nightly/cu130"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 WINDOWS_LATE_EXIT_CODES = {0xC0000409, -1073740791}
+SESSION_PREFIX = "seedvr2-batch-"
+SESSION_MARKER = ".clean-seedvr2-session"
+SESSION_MAGIC = "clean-seedvr2-upscaler-owned-session-v1"
 
 
 @dataclass(frozen=True)
 class Resolution:
     short_side: int
     exact_size: tuple[int, int] | None
+
+
+@dataclass(frozen=True)
+class TemporaryEnvironment:
+    cache: Path
+    root: Path
+    parent: Path
+    token: str
 
 
 def parse_resolution(value: str) -> Resolution:
@@ -124,17 +136,23 @@ def run(command: list[os.PathLike[str] | str], cwd: Path | None = None) -> None:
     subprocess.run(values, cwd=cwd, check=True)
 
 
-def create_temporary_environment() -> tuple[Path, Path]:
+def create_temporary_environment() -> TemporaryEnvironment:
     """Create an owned session directory and redirect task caches into it."""
     parent = Path(
         os.environ.get("SEEDVR2_TEMP_ROOT", tempfile.gettempdir())
     ).expanduser().resolve()
     parent.mkdir(parents=True, exist_ok=True)
-    cleanup_root = Path(tempfile.mkdtemp(prefix="seedvr2-batch-", dir=parent))
+    cleanup_root = Path(tempfile.mkdtemp(prefix=SESSION_PREFIX, dir=parent))
     cache = cleanup_root / "runtime"
     session_temp = cleanup_root / "tmp"
+    token = secrets.token_hex(32)
     cache.mkdir()
     session_temp.mkdir()
+    marker = cleanup_root / SESSION_MARKER
+    marker.write_text(
+        f"{SESSION_MAGIC}\n{token}\n{cleanup_root}\n",
+        encoding="utf-8",
+    )
 
     redirected = {
         "UV_CACHE_DIR": cleanup_root / "uv-cache",
@@ -153,16 +171,37 @@ def create_temporary_environment() -> tuple[Path, Path]:
     }
     for name, path in redirected.items():
         os.environ[name] = os.fspath(path)
-    return cache, cleanup_root
+    return TemporaryEnvironment(
+        cache=cache,
+        root=cleanup_root,
+        parent=parent,
+        token=token,
+    )
 
 
-def remove_temporary_environment(cleanup_root: Path) -> None:
+def remove_temporary_environment(session: TemporaryEnvironment) -> None:
+    cleanup_root = session.root
     if not cleanup_root.exists():
         return
 
+    if cleanup_root.is_symlink() or (
+        hasattr(cleanup_root, "is_junction") and cleanup_root.is_junction()
+    ):
+        raise RuntimeError(f"Refusing to remove a linked cleanup path: {cleanup_root}")
+
     cleanup_root = cleanup_root.resolve()
-    if not cleanup_root.name.startswith("seedvr2-batch-"):
+    if cleanup_root.parent != session.parent or not cleanup_root.name.startswith(
+        SESSION_PREFIX
+    ):
         raise RuntimeError(f"Refusing to remove an unsafe cleanup path: {cleanup_root}")
+
+    marker = cleanup_root / SESSION_MARKER
+    expected_marker = f"{SESSION_MAGIC}\n{session.token}\n{cleanup_root}\n"
+    if marker.is_symlink() or not marker.is_file():
+        raise RuntimeError(f"Refusing to remove an unowned cleanup path: {cleanup_root}")
+    actual_marker = marker.read_text(encoding="utf-8")
+    if not secrets.compare_digest(actual_marker, expected_marker):
+        raise RuntimeError(f"Cleanup ownership marker did not match: {cleanup_root}")
 
     print(f"\nRemoving temporary SeedVR2 environment: {cleanup_root}", flush=True)
 
@@ -467,11 +506,11 @@ def main() -> int:
 
     output_existed = output.exists()
     cli_output, targets = prepare_output(source, output, images)
-    cache, cleanup_root = create_temporary_environment()
+    session = create_temporary_environment()
     try:
         uv = find_uv()
-        seedvr2_source = ensure_source(cache)
-        python = ensure_environment(cache, seedvr2_source, uv)
+        seedvr2_source = ensure_source(session.cache)
+        python = ensure_environment(session.cache, seedvr2_source, uv)
 
         destination = args.output_res.exact_size or (
             f"short side {args.output_res.short_side}"
@@ -499,7 +538,7 @@ def main() -> int:
             output.rmdir()
         raise
     finally:
-        remove_temporary_environment(cleanup_root)
+        remove_temporary_environment(session)
 
 
 if __name__ == "__main__":

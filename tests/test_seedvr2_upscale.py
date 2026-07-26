@@ -63,21 +63,42 @@ class CleanupTests(unittest.TestCase):
     def test_session_redirects_caches_and_is_removed(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             with patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}):
-                cache, cleanup_root = MODULE.create_temporary_environment()
-                self.assertTrue(cache.is_dir())
-                self.assertTrue(cleanup_root.name.startswith("seedvr2-batch-"))
+                session = MODULE.create_temporary_environment()
+                self.assertTrue(session.cache.is_dir())
+                self.assertTrue(session.root.name.startswith("seedvr2-batch-"))
                 self.assertTrue(
-                    Path(os.environ["UV_CACHE_DIR"]).is_relative_to(cleanup_root)
+                    Path(os.environ["UV_CACHE_DIR"]).is_relative_to(session.root)
                 )
-                MODULE.remove_temporary_environment(cleanup_root)
-                self.assertFalse(cleanup_root.exists())
+                MODULE.remove_temporary_environment(session)
+                self.assertFalse(session.root.exists())
 
     def test_cleanup_rejects_unowned_directory(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="not-owned-") as value:
-            directory = Path(value)
+        with tempfile.TemporaryDirectory() as value:
+            parent = Path(value)
+            directory = Path(
+                tempfile.mkdtemp(prefix="seedvr2-batch-", dir=parent)
+            )
+            session = MODULE.TemporaryEnvironment(
+                cache=directory / "runtime",
+                root=directory,
+                parent=parent,
+                token="not-a-real-token",
+            )
             with self.assertRaises(RuntimeError):
-                MODULE.remove_temporary_environment(directory)
+                MODULE.remove_temporary_environment(session)
             self.assertTrue(directory.exists())
+
+    def test_cleanup_rejects_tampered_ownership_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            with patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}):
+                session = MODULE.create_temporary_environment()
+                (session.root / MODULE.SESSION_MARKER).write_text(
+                    "tampered",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(RuntimeError):
+                    MODULE.remove_temporary_environment(session)
+                self.assertTrue(session.root.exists())
 
 
 if __name__ == "__main__":

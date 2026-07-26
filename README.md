@@ -20,7 +20,7 @@ The wrapper is Windows-first and tuned for an NVIDIA GPU with limited VRAM. It w
 - Removes partial outputs after a failed run.
 - Deletes its venv, model weights, source tree, package caches, and task caches on success or failure.
 
-The script only removes the uniquely named `seedvr2-batch-*` directory that it created. It does not accept an arbitrary cache or cleanup path.
+The script only removes the uniquely named `seedvr2-batch-*` directory that it created. It does not accept an arbitrary cache or cleanup path. Before deletion it verifies the original resolved parent, rejects symlinks and Windows junctions, and checks a per-run cryptographic ownership marker stored both in memory and inside the session directory.
 
 ## Requirements
 
@@ -75,7 +75,7 @@ $env:SEEDVR2_TEMP_ROOT = "D:\Temp"
 uv run seedvr2_upscale.py .\input .\output 2560x1440
 ```
 
-The script creates a random `seedvr2-batch-*` child inside that directory and removes only that child when finished.
+The script creates a random `seedvr2-batch-*` child inside that directory and removes only that cryptographically marked child when finished. The parent directory and neighboring files are never deletion targets.
 
 ## Cleanup boundaries
 
