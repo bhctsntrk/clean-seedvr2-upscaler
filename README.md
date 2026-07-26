@@ -12,7 +12,7 @@ The wrapper supports:
 - Linux with an NVIDIA GPU
 - Apple Silicon macOS with PyTorch MPS
 
-Unit tests run on Windows, Ubuntu, and macOS in GitHub Actions. End-to-end GPU inference has been tested on Windows 11 with an RTX 3060 12 GB. The macOS and Linux paths should be treated as supported but hardware-dependent until they receive broader real-GPU testing.
+Unit tests run on Windows, Ubuntu, and macOS in GitHub Actions. End-to-end GPU inference has been tested on Windows with a supported NVIDIA GPU. The macOS and Linux paths should be treated as supported but hardware-dependent until they receive broader real-GPU testing.
 
 ## Quick start
 
@@ -98,7 +98,7 @@ uv run seedvr2_upscale.py input output 2560x1440 --temp-dir /mnt/fast/tmp
 The `SEEDVR2_TEMP_ROOT` environment variable remains supported as a fallback:
 
 ```powershell
-$env:SEEDVR2_TEMP_ROOT = "D:\"
+$env:SEEDVR2_TEMP_ROOT = "E:\AI-Temp"
 uv run seedvr2_upscale.py .\input .\output 2560x1440
 ```
 

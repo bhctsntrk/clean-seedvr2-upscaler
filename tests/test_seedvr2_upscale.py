@@ -325,7 +325,10 @@ class PlatformTests(unittest.TestCase):
             )
 
     def test_nvidia_accelerator_selects_requested_device(self) -> None:
-        output = "0, RTX 3060, 12288, 999.1\n1, RTX 4090, 24564, 999.1\n"
+        output = (
+            "0, NVIDIA Test GPU Small, 12288, 999.1\n"
+            "1, NVIDIA Test GPU Large, 24564, 999.1\n"
+        )
         with patch.object(MODULE, "find_nvidia_smi", return_value=Path("nvidia-smi")):
             with patch.object(
                 MODULE.subprocess,
@@ -333,7 +336,7 @@ class PlatformTests(unittest.TestCase):
                 return_value=SimpleNamespace(stdout=output),
             ):
                 name, memory = MODULE.nvidia_accelerator(1)
-        self.assertIn("RTX 4090", name)
+        self.assertIn("Test GPU Large", name)
         self.assertEqual(memory, 24564 * 1024**2)
 
     def test_apple_silicon_uses_unified_memory(self) -> None:
