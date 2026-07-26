@@ -34,9 +34,10 @@ import tempfile
 import time
 import urllib.request
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-
+from typing import cast
 
 # SeedVR2 prints Unicode status icons. Force UTF-8 so a redirected Windows
 # cp1252 console cannot crash inference while writing progress messages.
@@ -124,7 +125,9 @@ def parse_resolution(value: str) -> Resolution:
 
     width, height = (int(part) for part in match.groups())
     if min(width, height) < 64:
-        raise argparse.ArgumentTypeError("both output dimensions must be at least 64 pixels")
+        raise argparse.ArgumentTypeError(
+            "both output dimensions must be at least 64 pixels"
+        )
     return Resolution(short_side=min(width, height), exact_size=(width, height))
 
 
@@ -207,7 +210,9 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     if not args.preflight_only and (
         args.input is None or args.output is None or args.output_res is None
     ):
-        parser.error("INPUT, OUTPUT and OUTPUT_RES are required unless --preflight-only is used")
+        parser.error(
+            "INPUT, OUTPUT and OUTPUT_RES are required unless --preflight-only is used"
+        )
     return args
 
 
@@ -303,9 +308,13 @@ def total_ram_bytes(system: str | None = None) -> int:
         return int(result.stdout.strip())
 
     if selected == "Linux":
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        page_count = os.sysconf("SC_PHYS_PAGES")
-        return int(page_size * page_count)
+        sysconf_value = vars(os).get("sysconf")
+        if not callable(sysconf_value):
+            raise RuntimeError("Linux RAM detection failed")
+        sysconf = cast(Callable[[str], int], sysconf_value)
+        page_size = sysconf("SC_PAGE_SIZE")
+        page_count = sysconf("SC_PHYS_PAGES")
+        return page_size * page_count
 
     raise RuntimeError(f"Unsupported operating system: {selected}")
 
@@ -318,16 +327,11 @@ def find_nvidia_smi() -> Path:
         program_files = os.environ.get("ProgramFiles")
         if program_files:
             candidate = (
-                Path(program_files)
-                / "NVIDIA Corporation"
-                / "NVSMI"
-                / "nvidia-smi.exe"
+                Path(program_files) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe"
             )
             if candidate.is_file():
                 return candidate
-    raise RuntimeError(
-        "An NVIDIA GPU and nvidia-smi are required on Windows and Linux"
-    )
+    raise RuntimeError("An NVIDIA GPU and nvidia-smi are required on Windows and Linux")
 
 
 def nvidia_accelerator(device: int) -> tuple[str, int]:
@@ -407,7 +411,9 @@ def run_preflight(
     for work_path in work_paths:
         existing = nearest_existing_path(work_path)
         device_id = os.stat(existing).st_dev
-        disk_locations.setdefault(device_id, (existing, shutil.disk_usage(existing).free))
+        disk_locations.setdefault(
+            device_id, (existing, shutil.disk_usage(existing).free)
+        )
 
     failures: list[str] = []
     if min_cpu_cores and profile.cpu_cores < min_cpu_cores:
@@ -599,7 +605,9 @@ def build_cleanup_manifest(root: Path, marker: Path) -> list[CleanupEntry]:
             try:
                 path.relative_to(root)
             except ValueError as error:
-                raise RuntimeError(f"Cleanup entry escaped its session root: {path}") from error
+                raise RuntimeError(
+                    f"Cleanup entry escaped its session root: {path}"
+                ) from error
             if path == marker:
                 continue
 
@@ -609,14 +617,19 @@ def build_cleanup_manifest(root: Path, marker: Path) -> list[CleanupEntry]:
             info = os.lstat(path)
             kind = cleanup_kind(info)
             if kind == "special":
-                raise RuntimeError(f"Refusing to remove a special filesystem entry: {path}")
+                raise RuntimeError(
+                    f"Refusing to remove a special filesystem entry: {path}"
+                )
             if info.st_dev != root_identity.st_dev:
                 raise RuntimeError(f"Refusing to cross a filesystem boundary: {path}")
             if kind == "directory":
                 if is_filesystem_boundary(path, info):
-                    raise RuntimeError(f"Refusing to cross a mounted filesystem: {path}")
+                    raise RuntimeError(
+                        f"Refusing to cross a mounted filesystem: {path}"
+                    )
                 scan(path)
             manifest.append(CleanupEntry(path=path, identity=info, kind=kind))
+
     scan(root)
     return manifest
 
@@ -642,7 +655,9 @@ def remove_manifest_entry(entry: CleanupEntry) -> None:
         os.chmod(entry.path, current.st_mode | stat.S_IWRITE)
         changed_mode = os.lstat(entry.path)
         if not os.path.samestat(current, changed_mode):
-            raise RuntimeError(f"Cleanup path identity changed after chmod: {entry.path}")
+            raise RuntimeError(
+                f"Cleanup path identity changed after chmod: {entry.path}"
+            )
         remove()
 
 
@@ -690,25 +705,37 @@ def remove_temporary_environment(session: TemporaryEnvironment) -> None:
     if not root_exists and not container_exists:
         return
     if root_exists and container_exists:
-        raise RuntimeError("Both live and quarantined cleanup paths exist; refusing deletion")
+        raise RuntimeError(
+            "Both live and quarantined cleanup paths exist; refusing deletion"
+        )
 
     expected_marker = f"{SESSION_MAGIC}\n{session.token}\n{cleanup_root}\n"
     if root_exists:
-        if cleanup_root.is_symlink() or (
-            hasattr(cleanup_root, "is_junction") and cleanup_root.is_junction()
-        ):
-            raise RuntimeError(f"Refusing to remove a linked cleanup path: {cleanup_root}")
+        if cleanup_kind(os.lstat(cleanup_root)) == "link":
+            raise RuntimeError(
+                f"Refusing to remove a linked cleanup path: {cleanup_root}"
+            )
         resolved_root = cleanup_root.resolve()
         if resolved_root != cleanup_root or cleanup_root.parent != session.parent:
-            raise RuntimeError(f"Refusing to remove an unsafe cleanup path: {cleanup_root}")
+            raise RuntimeError(
+                f"Refusing to remove an unsafe cleanup path: {cleanup_root}"
+            )
         if not cleanup_root.name.startswith(SESSION_PREFIX):
-            raise RuntimeError(f"Refusing to remove an unsafe cleanup path: {cleanup_root}")
+            raise RuntimeError(
+                f"Refusing to remove an unsafe cleanup path: {cleanup_root}"
+            )
 
         marker = cleanup_root / SESSION_MARKER
         if marker.is_symlink() or not marker.is_file():
-            raise RuntimeError(f"Refusing to remove an unowned cleanup path: {cleanup_root}")
-        if not secrets.compare_digest(marker.read_text(encoding="utf-8"), expected_marker):
-            raise RuntimeError(f"Cleanup ownership marker did not match: {cleanup_root}")
+            raise RuntimeError(
+                f"Refusing to remove an unowned cleanup path: {cleanup_root}"
+            )
+        if not secrets.compare_digest(
+            marker.read_text(encoding="utf-8"), expected_marker
+        ):
+            raise RuntimeError(
+                f"Cleanup ownership marker did not match: {cleanup_root}"
+            )
 
         root_identity = os.lstat(cleanup_root)
         quarantine_container.mkdir(mode=0o700)
@@ -795,9 +822,11 @@ def ensure_source(cache_directory: Path) -> Path:
         SEEDVR2_ARCHIVE,
         headers={"User-Agent": "clean-seedvr2-upscaler"},
     )
-    with urllib.request.urlopen(request, timeout=120) as response:
-        with archive_path.open("wb") as file:
-            shutil.copyfileobj(response, file)
+    with (
+        urllib.request.urlopen(request, timeout=120) as response,
+        archive_path.open("wb") as file,
+    ):
+        shutil.copyfileobj(response, file)
 
     extraction_root.mkdir()
     with zipfile.ZipFile(archive_path) as archive:
@@ -847,7 +876,11 @@ def ensure_environment(
     python = venv_python(venv)
     marker = venv / ".seedvr2-wrapper-ready"
 
-    if python.is_file() and marker.is_file() and marker.read_text().strip() == fingerprint:
+    if (
+        python.is_file()
+        and marker.is_file()
+        and marker.read_text().strip() == fingerprint
+    ):
         print(f"Reusing SeedVR2 Python environment: {venv}", flush=True)
         return python
     if venv.exists():
@@ -976,16 +1009,22 @@ def publish_outputs(
 
     conflicts = [target for target in final_targets if os.path.lexists(target)]
     if conflicts:
-        raise RuntimeError(f"Output appeared during processing; refusing overwrite: {conflicts[0]}")
+        raise RuntimeError(
+            f"Output appeared during processing; refusing overwrite: {conflicts[0]}"
+        )
 
     for staged, final in zip(staged_targets, final_targets, strict=True):
         final.parent.mkdir(parents=True, exist_ok=True)
         if os.path.lexists(final):
-            raise RuntimeError(f"Output appeared during processing; refusing overwrite: {final}")
+            raise RuntimeError(
+                f"Output appeared during processing; refusing overwrite: {final}"
+            )
 
         partial = final.with_name(f".{final.name}.clean-seedvr2-{token}.partial")
         if os.path.lexists(partial):
-            raise RuntimeError(f"Refusing to replace an existing publish staging file: {partial}")
+            raise RuntimeError(
+                f"Refusing to replace an existing publish staging file: {partial}"
+            )
 
         expected_hash = sha256_file(staged)
         with staged.open("rb") as source, partial.open("xb") as destination:
@@ -1195,7 +1234,9 @@ def main() -> int:
     images = input_images(source)
 
     if source.is_dir() and (output == source or source in output.parents):
-        raise RuntimeError("For directory input, output must be outside the input directory")
+        raise RuntimeError(
+            "For directory input, output must be outside the input directory"
+        )
 
     final_targets = plan_outputs(source, output, images)
 
@@ -1243,7 +1284,10 @@ def main() -> int:
 
         for target in staged_targets:
             width, height = png_size(target)
-            if args.output_res.exact_size and (width, height) != args.output_res.exact_size:
+            if (
+                args.output_res.exact_size
+                and (width, height) != args.output_res.exact_size
+            ):
                 raise RuntimeError(
                     f"Generated output has wrong dimensions: {target} [{width}x{height}]"
                 )

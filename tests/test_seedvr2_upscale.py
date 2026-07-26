@@ -11,7 +11,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-
 SCRIPT = Path(__file__).parents[1] / "seedvr2_upscale.py"
 SPEC = importlib.util.spec_from_file_location("seedvr2_upscale", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
@@ -108,13 +107,15 @@ class InputOutputTests(unittest.TestCase):
                 Path(destination).write_bytes(b"user data")
                 return real_operation(source, destination)
 
-            with patch.object(
-                MODULE.os,
-                operation_name,
-                side_effect=create_competing_file_then_publish,
+            with (
+                patch.object(
+                    MODULE.os,
+                    operation_name,
+                    side_effect=create_competing_file_then_publish,
+                ),
+                self.assertRaises(OSError),
             ):
-                with self.assertRaises(OSError):
-                    MODULE.publish_outputs([staged], [final], "test-token")
+                MODULE.publish_outputs([staged], [final], "test-token")
             self.assertEqual(final.read_bytes(), b"user data")
 
 
@@ -135,63 +136,65 @@ class CleanupTests(unittest.TestCase):
             self.assertFalse(session.root.exists())
 
     def test_cleanup_does_not_depend_on_path_is_mount(self) -> None:
-        with tempfile.TemporaryDirectory() as value:
-            with patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}):
-                session = MODULE.create_temporary_environment()
-                temporary = session.root / "temporary.bin"
-                temporary.write_bytes(b"temporary")
-                with patch.object(
-                    Path,
-                    "is_mount",
-                    side_effect=NotImplementedError("unsupported"),
-                ):
-                    MODULE.remove_temporary_environment(session)
-                self.assertFalse(session.root.exists())
+        with (
+            tempfile.TemporaryDirectory() as value,
+            patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}),
+        ):
+            session = MODULE.create_temporary_environment()
+            temporary = session.root / "temporary.bin"
+            temporary.write_bytes(b"temporary")
+            with patch.object(
+                Path,
+                "is_mount",
+                side_effect=NotImplementedError("unsupported"),
+            ):
+                MODULE.remove_temporary_environment(session)
+            self.assertFalse(session.root.exists())
 
     def test_cleanup_fails_closed_at_filesystem_boundary(self) -> None:
-        with tempfile.TemporaryDirectory() as value:
-            with patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}):
-                session = MODULE.create_temporary_environment()
-                protected = session.root / "protected.bin"
-                protected.write_bytes(b"keep me")
-                with patch.object(
+        with (
+            tempfile.TemporaryDirectory() as value,
+            patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}),
+        ):
+            session = MODULE.create_temporary_environment()
+            protected = session.root / "protected.bin"
+            protected.write_bytes(b"keep me")
+            with (
+                patch.object(
                     MODULE,
                     "is_filesystem_boundary",
                     return_value=True,
-                ):
-                    with self.assertRaises(RuntimeError):
-                        MODULE.remove_temporary_environment(session)
-
-                quarantine = session.parent / (
-                    f"{MODULE.QUARANTINE_PREFIX}{session.token}"
-                )
-                quarantined_file = quarantine / "session" / protected.name
-                self.assertEqual(quarantined_file.read_bytes(), b"keep me")
+                ),
+                self.assertRaises(RuntimeError),
+            ):
                 MODULE.remove_temporary_environment(session)
-                self.assertFalse(quarantine.exists())
+
+            quarantine = session.parent / (f"{MODULE.QUARANTINE_PREFIX}{session.token}")
+            quarantined_file = quarantine / "session" / protected.name
+            self.assertEqual(quarantined_file.read_bytes(), b"keep me")
+            MODULE.remove_temporary_environment(session)
+            self.assertFalse(quarantine.exists())
 
     def test_session_redirects_caches_and_is_removed(self) -> None:
-        with tempfile.TemporaryDirectory() as value:
-            with patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}):
-                session = MODULE.create_temporary_environment()
-                self.assertTrue(session.cache.is_dir())
-                self.assertTrue(session.root.name.startswith("seedvr2-batch-"))
-                self.assertTrue(
-                    Path(os.environ["UV_CACHE_DIR"]).is_relative_to(session.root)
-                )
-                MODULE.remove_temporary_environment(session)
-                self.assertFalse(session.root.exists())
-                quarantine = session.parent / (
-                    f"{MODULE.QUARANTINE_PREFIX}{session.token}"
-                )
-                self.assertFalse(quarantine.exists())
+        with (
+            tempfile.TemporaryDirectory() as value,
+            patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}),
+        ):
+            session = MODULE.create_temporary_environment()
+            self.assertTrue(session.cache.is_dir())
+            self.assertTrue(session.root.name.startswith("seedvr2-batch-"))
+            self.assertTrue(
+                Path(os.environ["UV_CACHE_DIR"]).is_relative_to(session.root)
+            )
+            MODULE.remove_temporary_environment(session)
+            self.assertFalse(session.root.exists())
+            quarantine = session.parent / (f"{MODULE.QUARANTINE_PREFIX}{session.token}")
+            self.assertFalse(quarantine.exists())
 
     def test_cleanup_rejects_unowned_directory(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             parent = Path(value)
-            directory = Path(
-                tempfile.mkdtemp(prefix="seedvr2-batch-", dir=parent)
-            )
+            directory = Path(tempfile.mkdtemp(prefix="seedvr2-batch-", dir=parent))
             session = MODULE.TemporaryEnvironment(
                 cache=directory / "runtime",
                 root=directory,
@@ -203,31 +206,33 @@ class CleanupTests(unittest.TestCase):
             self.assertTrue(directory.exists())
 
     def test_cleanup_rejects_tampered_ownership_marker(self) -> None:
-        with tempfile.TemporaryDirectory() as value:
-            with patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}):
-                session = MODULE.create_temporary_environment()
-                (session.root / MODULE.SESSION_MARKER).write_text(
-                    "tampered",
-                    encoding="utf-8",
-                )
-                with self.assertRaises(RuntimeError):
-                    MODULE.remove_temporary_environment(session)
-                self.assertTrue(session.root.exists())
+        with (
+            tempfile.TemporaryDirectory() as value,
+            patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}),
+        ):
+            session = MODULE.create_temporary_environment()
+            (session.root / MODULE.SESSION_MARKER).write_text(
+                "tampered",
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError):
+                MODULE.remove_temporary_environment(session)
+            self.assertTrue(session.root.exists())
 
     def test_cleanup_rejects_quarantine_name_collision(self) -> None:
-        with tempfile.TemporaryDirectory() as value:
-            with patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}):
-                session = MODULE.create_temporary_environment()
-                quarantine = session.parent / (
-                    f"{MODULE.QUARANTINE_PREFIX}{session.token}"
-                )
-                quarantine.mkdir()
-                protected = quarantine / "protected.txt"
-                protected.write_text("keep me", encoding="utf-8")
-                with self.assertRaises(RuntimeError):
-                    MODULE.remove_temporary_environment(session)
-                self.assertTrue(session.root.exists())
-                self.assertEqual(protected.read_text(encoding="utf-8"), "keep me")
+        with (
+            tempfile.TemporaryDirectory() as value,
+            patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}),
+        ):
+            session = MODULE.create_temporary_environment()
+            quarantine = session.parent / (f"{MODULE.QUARANTINE_PREFIX}{session.token}")
+            quarantine.mkdir()
+            protected = quarantine / "protected.txt"
+            protected.write_text("keep me", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                MODULE.remove_temporary_environment(session)
+            self.assertTrue(session.root.exists())
+            self.assertEqual(protected.read_text(encoding="utf-8"), "keep me")
 
     def test_identity_change_is_rejected_without_deleting_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -245,14 +250,16 @@ class CleanupTests(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), "replacement")
 
     def test_read_only_file_inside_owned_session_is_removed(self) -> None:
-        with tempfile.TemporaryDirectory() as value:
-            with patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}):
-                session = MODULE.create_temporary_environment()
-                read_only = session.root / "read-only.bin"
-                read_only.write_bytes(b"temporary")
-                read_only.chmod(0o444)
-                MODULE.remove_temporary_environment(session)
-                self.assertFalse(session.root.exists())
+        with (
+            tempfile.TemporaryDirectory() as value,
+            patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}),
+        ):
+            session = MODULE.create_temporary_environment()
+            read_only = session.root / "read-only.bin"
+            read_only.write_bytes(b"temporary")
+            read_only.chmod(0o444)
+            MODULE.remove_temporary_environment(session)
+            self.assertFalse(session.root.exists())
 
     def test_cleanup_never_follows_a_directory_link(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -329,29 +336,35 @@ class PlatformTests(unittest.TestCase):
             "0, NVIDIA Test GPU Small, 12288, 999.1\n"
             "1, NVIDIA Test GPU Large, 24564, 999.1\n"
         )
-        with patch.object(MODULE, "find_nvidia_smi", return_value=Path("nvidia-smi")):
-            with patch.object(
+        with (
+            patch.object(MODULE, "find_nvidia_smi", return_value=Path("nvidia-smi")),
+            patch.object(
                 MODULE.subprocess,
                 "run",
                 return_value=SimpleNamespace(stdout=output),
-            ):
-                name, memory = MODULE.nvidia_accelerator(1)
+            ),
+        ):
+            name, memory = MODULE.nvidia_accelerator(1)
         self.assertIn("Test GPU Large", name)
         self.assertEqual(memory, 24564 * 1024**2)
 
     def test_apple_silicon_uses_unified_memory(self) -> None:
-        with patch.object(MODULE.platform, "machine", return_value="arm64"):
-            with patch.object(MODULE, "total_ram_bytes", return_value=32 * MODULE.GIB):
-                with patch.object(MODULE.os, "cpu_count", return_value=10):
-                    profile = MODULE.detect_hardware(0, "Darwin")
+        with (
+            patch.object(MODULE.platform, "machine", return_value="arm64"),
+            patch.object(MODULE, "total_ram_bytes", return_value=32 * MODULE.GIB),
+            patch.object(MODULE.os, "cpu_count", return_value=10),
+        ):
+            profile = MODULE.detect_hardware(0, "Darwin")
         self.assertEqual(profile.accelerator_memory_bytes, 32 * MODULE.GIB)
         self.assertIn("MPS", profile.accelerator)
 
     def test_intel_mac_is_rejected(self) -> None:
-        with patch.object(MODULE.platform, "machine", return_value="x86_64"):
-            with patch.object(MODULE, "total_ram_bytes", return_value=32 * MODULE.GIB):
-                with self.assertRaisesRegex(RuntimeError, "Apple Silicon"):
-                    MODULE.detect_hardware(0, "Darwin")
+        with (
+            patch.object(MODULE.platform, "machine", return_value="x86_64"),
+            patch.object(MODULE, "total_ram_bytes", return_value=32 * MODULE.GIB),
+            self.assertRaisesRegex(RuntimeError, "Apple Silicon"),
+        ):
+            MODULE.detect_hardware(0, "Darwin")
 
 
 class PreflightTests(unittest.TestCase):
@@ -364,15 +377,17 @@ class PreflightTests(unittest.TestCase):
             accelerator="NVIDIA test",
             accelerator_memory_bytes=4 * MODULE.GIB,
         )
-        with tempfile.TemporaryDirectory() as value:
-            with patch.object(MODULE, "detect_hardware", return_value=profile):
-                with patch.object(
-                    MODULE.shutil,
-                    "disk_usage",
-                    return_value=SimpleNamespace(free=5 * MODULE.GIB),
-                ):
-                    with self.assertRaisesRegex(RuntimeError, "CPU has 2"):
-                        MODULE.run_preflight([Path(value)], 0, 4, 16, 8, 20)
+        with (
+            tempfile.TemporaryDirectory() as value,
+            patch.object(MODULE, "detect_hardware", return_value=profile),
+            patch.object(
+                MODULE.shutil,
+                "disk_usage",
+                return_value=SimpleNamespace(free=5 * MODULE.GIB),
+            ),
+            self.assertRaisesRegex(RuntimeError, "CPU has 2"),
+        ):
+            MODULE.run_preflight([Path(value)], 0, 4, 16, 8, 20)
 
     def test_zero_limits_disable_resource_refusal(self) -> None:
         profile = MODULE.HardwareProfile(
@@ -383,14 +398,16 @@ class PreflightTests(unittest.TestCase):
             accelerator="NVIDIA test",
             accelerator_memory_bytes=1,
         )
-        with tempfile.TemporaryDirectory() as value:
-            with patch.object(MODULE, "detect_hardware", return_value=profile):
-                with patch.object(
-                    MODULE.shutil,
-                    "disk_usage",
-                    return_value=SimpleNamespace(free=1),
-                ):
-                    actual = MODULE.run_preflight([Path(value)], 0, 0, 0, 0, 0)
+        with (
+            tempfile.TemporaryDirectory() as value,
+            patch.object(MODULE, "detect_hardware", return_value=profile),
+            patch.object(
+                MODULE.shutil,
+                "disk_usage",
+                return_value=SimpleNamespace(free=1),
+            ),
+        ):
+            actual = MODULE.run_preflight([Path(value)], 0, 0, 0, 0, 0)
         self.assertEqual(actual, profile)
 
 
@@ -431,7 +448,11 @@ class RuntimeTests(unittest.TestCase):
             source.touch()
             target.touch()
             commands: list[list[object]] = []
-            with patch.object(MODULE, "run", side_effect=lambda command, cwd=None: commands.append(command)):
+            with patch.object(
+                MODULE,
+                "run",
+                side_effect=lambda command, cwd=None: commands.append(command),
+            ):
                 MODULE.upscale(
                     source,
                     target,
@@ -455,7 +476,11 @@ class RuntimeTests(unittest.TestCase):
             source.touch()
             target.touch()
             commands: list[list[object]] = []
-            with patch.object(MODULE, "run", side_effect=lambda command, cwd=None: commands.append(command)):
+            with patch.object(
+                MODULE,
+                "run",
+                side_effect=lambda command, cwd=None: commands.append(command),
+            ):
                 MODULE.upscale(
                     source,
                     target,
