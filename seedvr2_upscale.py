@@ -14,7 +14,8 @@ OUTPUT_RES accepts either:
 
 Each invocation creates an isolated temporary SeedVR2/CUDA environment. A whole
 input directory is processed in one batch, then the environment, model weights,
-and package caches are deleted automatically. Only validated outputs remain.
+and package caches are deleted automatically. Successful runs publish only
+validated outputs.
 """
 
 from __future__ import annotations
@@ -50,6 +51,7 @@ CUDA_WHEEL_INDEX = "https://download.pytorch.org/whl/nightly/cu130"
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 WINDOWS_LATE_EXIT_CODES = {0xC0000409, -1073740791}
 SESSION_PREFIX = "seedvr2-batch-"
+QUARANTINE_PREFIX = ".clean-seedvr2-delete-"
 SESSION_MARKER = ".clean-seedvr2-session"
 SESSION_MAGIC = "clean-seedvr2-upscaler-owned-session-v1"
 
@@ -66,6 +68,13 @@ class TemporaryEnvironment:
     root: Path
     parent: Path
     token: str
+
+
+@dataclass(frozen=True)
+class CleanupEntry:
+    path: Path
+    identity: os.stat_result
+    kind: str
 
 
 def parse_resolution(value: str) -> Resolution:
@@ -179,40 +188,175 @@ def create_temporary_environment() -> TemporaryEnvironment:
     )
 
 
-def remove_temporary_environment(session: TemporaryEnvironment) -> None:
-    cleanup_root = session.root
-    if not cleanup_root.exists():
-        return
+def cleanup_kind(info: os.stat_result) -> str:
+    attributes = getattr(info, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    if stat.S_ISLNK(info.st_mode) or attributes & reparse_flag:
+        return "link"
+    if stat.S_ISDIR(info.st_mode):
+        return "directory"
+    if stat.S_ISREG(info.st_mode):
+        return "file"
+    return "special"
 
-    if cleanup_root.is_symlink() or (
-        hasattr(cleanup_root, "is_junction") and cleanup_root.is_junction()
-    ):
-        raise RuntimeError(f"Refusing to remove a linked cleanup path: {cleanup_root}")
 
-    cleanup_root = cleanup_root.resolve()
-    if cleanup_root.parent != session.parent or not cleanup_root.name.startswith(
-        SESSION_PREFIX
-    ):
-        raise RuntimeError(f"Refusing to remove an unsafe cleanup path: {cleanup_root}")
+def verify_cleanup_entry(entry: CleanupEntry) -> os.stat_result:
+    current = os.lstat(entry.path)
+    if not os.path.samestat(entry.identity, current):
+        raise RuntimeError(f"Cleanup path identity changed: {entry.path}")
+    if cleanup_kind(current) != entry.kind:
+        raise RuntimeError(f"Cleanup path type changed: {entry.path}")
+    return current
 
-    marker = cleanup_root / SESSION_MARKER
-    expected_marker = f"{SESSION_MAGIC}\n{session.token}\n{cleanup_root}\n"
-    if marker.is_symlink() or not marker.is_file():
-        raise RuntimeError(f"Refusing to remove an unowned cleanup path: {cleanup_root}")
+
+def build_cleanup_manifest(root: Path, marker: Path) -> list[CleanupEntry]:
+    manifest: list[CleanupEntry] = []
+
+    def scan(directory: Path) -> None:
+        with os.scandir(directory) as iterator:
+            entries = sorted(iterator, key=lambda entry: entry.name.casefold())
+        for item in entries:
+            path = Path(item.path)
+            try:
+                path.relative_to(root)
+            except ValueError as error:
+                raise RuntimeError(f"Cleanup entry escaped its session root: {path}") from error
+            if path == marker:
+                continue
+
+            # Windows DirEntry.stat() may report st_dev/st_ino as zero even
+            # when os.lstat() exposes the stable filesystem identity. Use the
+            # same identity API for both manifest creation and deletion checks.
+            info = os.lstat(path)
+            kind = cleanup_kind(info)
+            if kind == "special":
+                raise RuntimeError(f"Refusing to remove a special filesystem entry: {path}")
+            if kind == "directory":
+                if path.is_mount():
+                    raise RuntimeError(f"Refusing to cross a mounted filesystem: {path}")
+                scan(path)
+            manifest.append(CleanupEntry(path=path, identity=info, kind=kind))
+    scan(root)
+    return manifest
+
+
+def remove_manifest_entry(entry: CleanupEntry) -> None:
+    current = verify_cleanup_entry(entry)
+    attributes = getattr(current, "st_file_attributes", 0)
+    directory_flag = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0)
+
+    def remove() -> None:
+        if entry.kind == "directory" or (
+            entry.kind == "link" and os.name == "nt" and attributes & directory_flag
+        ):
+            os.rmdir(entry.path)
+        else:
+            os.unlink(entry.path)
+
+    try:
+        remove()
+    except PermissionError:
+        if entry.kind == "link":
+            raise
+        os.chmod(entry.path, current.st_mode | stat.S_IWRITE)
+        verify_cleanup_entry(entry)
+        remove()
+
+
+def remove_quarantined_tree(
+    root: Path,
+    expected_root_identity: os.stat_result,
+    marker: Path,
+    expected_marker: str,
+) -> None:
+    root_identity = os.lstat(root)
+    if not os.path.samestat(expected_root_identity, root_identity):
+        raise RuntimeError(f"Quarantined cleanup root identity changed: {root}")
+    if cleanup_kind(root_identity) != "directory" or root.is_mount():
+        raise RuntimeError(f"Quarantined cleanup root is not a plain directory: {root}")
+
+    marker_identity = os.lstat(marker)
+    if cleanup_kind(marker_identity) != "file":
+        raise RuntimeError(f"Cleanup ownership marker is not a regular file: {marker}")
     actual_marker = marker.read_text(encoding="utf-8")
     if not secrets.compare_digest(actual_marker, expected_marker):
-        raise RuntimeError(f"Cleanup ownership marker did not match: {cleanup_root}")
+        raise RuntimeError(f"Cleanup ownership marker did not match: {root}")
 
-    print(f"\nRemoving temporary SeedVR2 environment: {cleanup_root}", flush=True)
+    manifest = build_cleanup_manifest(root, marker)
+    for entry in manifest:
+        remove_manifest_entry(entry)
 
-    def make_writable_and_retry(function, path, _error_info) -> None:
-        os.chmod(path, stat.S_IWRITE)
-        function(path)
+    remove_manifest_entry(
+        CleanupEntry(path=marker, identity=marker_identity, kind="file")
+    )
+    verify_cleanup_entry(
+        CleanupEntry(path=root, identity=root_identity, kind="directory")
+    )
+    os.rmdir(root)
 
+
+def remove_temporary_environment(session: TemporaryEnvironment) -> None:
+    cleanup_root = session.root
+    quarantine_container = session.parent / f"{QUARANTINE_PREFIX}{session.token}"
+    quarantine = quarantine_container / "session"
+    root_exists = os.path.lexists(cleanup_root)
+    container_exists = os.path.lexists(quarantine_container)
+    if not root_exists and not container_exists:
+        return
+    if root_exists and container_exists:
+        raise RuntimeError("Both live and quarantined cleanup paths exist; refusing deletion")
+
+    expected_marker = f"{SESSION_MAGIC}\n{session.token}\n{cleanup_root}\n"
+    if root_exists:
+        if cleanup_root.is_symlink() or (
+            hasattr(cleanup_root, "is_junction") and cleanup_root.is_junction()
+        ):
+            raise RuntimeError(f"Refusing to remove a linked cleanup path: {cleanup_root}")
+        resolved_root = cleanup_root.resolve()
+        if resolved_root != cleanup_root or cleanup_root.parent != session.parent:
+            raise RuntimeError(f"Refusing to remove an unsafe cleanup path: {cleanup_root}")
+        if not cleanup_root.name.startswith(SESSION_PREFIX):
+            raise RuntimeError(f"Refusing to remove an unsafe cleanup path: {cleanup_root}")
+
+        marker = cleanup_root / SESSION_MARKER
+        if marker.is_symlink() or not marker.is_file():
+            raise RuntimeError(f"Refusing to remove an unowned cleanup path: {cleanup_root}")
+        if not secrets.compare_digest(marker.read_text(encoding="utf-8"), expected_marker):
+            raise RuntimeError(f"Cleanup ownership marker did not match: {cleanup_root}")
+
+        root_identity = os.lstat(cleanup_root)
+        quarantine_container.mkdir(mode=0o700)
+        container_identity = os.lstat(quarantine_container)
+        os.rename(cleanup_root, quarantine)
+        moved_identity = os.lstat(quarantine)
+        if not os.path.samestat(root_identity, moved_identity):
+            raise RuntimeError("Cleanup root identity changed during quarantine")
+    else:
+        container_identity = os.lstat(quarantine_container)
+        if cleanup_kind(container_identity) != "directory":
+            raise RuntimeError("Cleanup quarantine container is not a plain directory")
+        if not os.path.lexists(quarantine):
+            raise RuntimeError("Cleanup quarantine exists without its owned session")
+        root_identity = os.lstat(quarantine)
+
+    print(f"\nRemoving quarantined SeedVR2 environment: {quarantine}", flush=True)
+    quarantined_marker = quarantine / SESSION_MARKER
     last_error: OSError | None = None
     for attempt in range(5):
         try:
-            shutil.rmtree(cleanup_root, onerror=make_writable_and_retry)
+            if os.path.lexists(quarantine):
+                remove_quarantined_tree(
+                    quarantine,
+                    root_identity,
+                    quarantined_marker,
+                    expected_marker,
+                )
+            current_container = os.lstat(quarantine_container)
+            if not os.path.samestat(container_identity, current_container):
+                raise RuntimeError("Cleanup quarantine container identity changed")
+            if cleanup_kind(current_container) != "directory":
+                raise RuntimeError("Cleanup quarantine container type changed")
+            os.rmdir(quarantine_container)
             return
         except OSError as error:
             last_error = error
@@ -253,7 +397,7 @@ def ensure_source(cache_directory: Path) -> Path:
     if len(candidates) != 1:
         raise RuntimeError("Downloaded SeedVR2 archive has an unexpected layout")
     candidates[0].parent.replace(source)
-    shutil.rmtree(extraction_root)
+    extraction_root.rmdir()
     archive_path.unlink()
     return source
 
@@ -338,31 +482,90 @@ def input_images(input_path: Path) -> list[Path]:
     raise RuntimeError(f"Input does not exist: {input_path}")
 
 
-def prepare_output(
+def plan_outputs(
     input_path: Path,
     output_path: Path,
     images: list[Path],
-) -> tuple[Path, list[Path]]:
+) -> list[Path]:
     if input_path.is_file() and output_path.suffix:
         if output_path.suffix.lower() != ".png":
             raise RuntimeError("A single output file must use the .png extension")
         targets = [output_path]
-        cli_output = output_path
     else:
         if output_path.exists() and not output_path.is_dir():
             raise RuntimeError(f"Output must be a directory: {output_path}")
-        output_path.mkdir(parents=True, exist_ok=True)
         targets = [output_path / f"{image.stem}.png" for image in images]
-        cli_output = output_path
 
-    conflicts = [target for target in targets if target.exists()]
+    conflicts = [target for target in targets if os.path.lexists(target)]
     if conflicts:
         joined = "\n".join(f"  {path}" for path in conflicts[:10])
         raise RuntimeError(f"Refusing to overwrite existing output files:\n{joined}")
+    return targets
 
-    for target in targets:
-        target.parent.mkdir(parents=True, exist_ok=True)
-    return cli_output, targets
+
+def stage_outputs(
+    session: TemporaryEnvironment,
+    input_path: Path,
+    final_targets: list[Path],
+) -> tuple[Path, list[Path]]:
+    directory = session.cache / "generated"
+    directory.mkdir()
+    staged_targets = [directory / target.name for target in final_targets]
+    if input_path.is_file() and len(staged_targets) == 1:
+        return staged_targets[0], staged_targets
+    return directory, staged_targets
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def publish_outputs(
+    staged_targets: list[Path],
+    final_targets: list[Path],
+    token: str,
+) -> None:
+    if len(staged_targets) != len(final_targets):
+        raise RuntimeError("Internal error: staged and final output counts differ")
+
+    conflicts = [target for target in final_targets if os.path.lexists(target)]
+    if conflicts:
+        raise RuntimeError(f"Output appeared during processing; refusing overwrite: {conflicts[0]}")
+
+    for staged, final in zip(staged_targets, final_targets, strict=True):
+        final.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(final):
+            raise RuntimeError(f"Output appeared during processing; refusing overwrite: {final}")
+
+        partial = final.with_name(f".{final.name}.clean-seedvr2-{token}.partial")
+        if os.path.lexists(partial):
+            raise RuntimeError(f"Refusing to replace an existing publish staging file: {partial}")
+
+        expected_hash = sha256_file(staged)
+        with staged.open("rb") as source, partial.open("xb") as destination:
+            shutil.copyfileobj(source, destination, length=1024 * 1024)
+            destination.flush()
+            os.fsync(destination.fileno())
+            partial_identity = os.fstat(destination.fileno())
+
+        if os.name == "nt":
+            os.rename(partial, final)
+            if not os.path.samestat(partial_identity, os.lstat(final)):
+                raise RuntimeError(f"Published output identity changed: {final}")
+        else:
+            os.link(partial, final)
+            if not os.path.samefile(partial, final):
+                raise RuntimeError(f"Published output identity changed: {final}")
+            if not os.path.samestat(partial_identity, os.lstat(partial)):
+                raise RuntimeError(f"Publish staging identity changed: {partial}")
+            os.unlink(partial)
+
+        if sha256_file(final) != expected_hash:
+            raise RuntimeError(f"Published output failed hash verification: {final}")
 
 
 def resize_fill(
@@ -504,13 +707,13 @@ def main() -> int:
     if source.is_dir() and (output == source or source in output.parents):
         raise RuntimeError("For directory input, output must be outside the input directory")
 
-    output_existed = output.exists()
-    cli_output, targets = prepare_output(source, output, images)
+    final_targets = plan_outputs(source, output, images)
     session = create_temporary_environment()
     try:
         uv = find_uv()
         seedvr2_source = ensure_source(session.cache)
         python = ensure_environment(session.cache, seedvr2_source, uv)
+        cli_output, staged_targets = stage_outputs(session, source, final_targets)
 
         destination = args.output_res.exact_size or (
             f"short side {args.output_res.short_side}"
@@ -519,24 +722,25 @@ def main() -> int:
         upscale(
             source,
             cli_output,
-            targets,
+            staged_targets,
             args.output_res,
             seedvr2_source,
             python,
         )
 
+        for target in staged_targets:
+            width, height = png_size(target)
+            if args.output_res.exact_size and (width, height) != args.output_res.exact_size:
+                raise RuntimeError(
+                    f"Generated output has wrong dimensions: {target} [{width}x{height}]"
+                )
+        publish_outputs(staged_targets, final_targets, session.token)
+
         print("\nCompleted:", flush=True)
-        for target in targets:
+        for target in final_targets:
             width, height = png_size(target)
             print(f"  {target}  [{width}x{height}]", flush=True)
         return 0
-    except BaseException:
-        for target in targets:
-            if target.is_file():
-                target.unlink()
-        if not output_existed and output.is_dir() and not any(output.iterdir()):
-            output.rmdir()
-        raise
     finally:
         remove_temporary_environment(session)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -56,7 +57,50 @@ class InputOutputTests(unittest.TestCase):
             source.touch()
             output.touch()
             with self.assertRaises(RuntimeError):
-                MODULE.prepare_output(source, output, [source])
+                MODULE.plan_outputs(source, output, [source])
+
+    def test_publish_does_not_overwrite_a_racing_output(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            directory = Path(value)
+            staged = directory / "staged.png"
+            final = directory / "final.png"
+            staged.write_bytes(b"generated")
+            final.write_bytes(b"user data")
+            with self.assertRaises(RuntimeError):
+                MODULE.publish_outputs([staged], [final], "test-token")
+            self.assertEqual(final.read_bytes(), b"user data")
+
+    def test_publish_copies_validated_data_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            directory = Path(value)
+            staged = directory / "staged.png"
+            final = directory / "nested" / "final.png"
+            staged.write_bytes(b"generated")
+            MODULE.publish_outputs([staged], [final], "test-token")
+            self.assertEqual(final.read_bytes(), b"generated")
+
+    def test_publish_race_preserves_the_competing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            directory = Path(value)
+            staged = directory / "staged.png"
+            final = directory / "final.png"
+            staged.write_bytes(b"generated")
+
+            operation_name = "rename" if os.name == "nt" else "link"
+            real_operation = getattr(os, operation_name)
+
+            def create_competing_file_then_publish(source, destination):
+                Path(destination).write_bytes(b"user data")
+                return real_operation(source, destination)
+
+            with patch.object(
+                MODULE.os,
+                operation_name,
+                side_effect=create_competing_file_then_publish,
+            ):
+                with self.assertRaises(OSError):
+                    MODULE.publish_outputs([staged], [final], "test-token")
+            self.assertEqual(final.read_bytes(), b"user data")
 
 
 class CleanupTests(unittest.TestCase):
@@ -71,6 +115,10 @@ class CleanupTests(unittest.TestCase):
                 )
                 MODULE.remove_temporary_environment(session)
                 self.assertFalse(session.root.exists())
+                quarantine = session.parent / (
+                    f"{MODULE.QUARANTINE_PREFIX}{session.token}"
+                )
+                self.assertFalse(quarantine.exists())
 
     def test_cleanup_rejects_unowned_directory(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -99,6 +147,96 @@ class CleanupTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     MODULE.remove_temporary_environment(session)
                 self.assertTrue(session.root.exists())
+
+    def test_cleanup_rejects_quarantine_name_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            with patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}):
+                session = MODULE.create_temporary_environment()
+                quarantine = session.parent / (
+                    f"{MODULE.QUARANTINE_PREFIX}{session.token}"
+                )
+                quarantine.mkdir()
+                protected = quarantine / "protected.txt"
+                protected.write_text("keep me", encoding="utf-8")
+                with self.assertRaises(RuntimeError):
+                    MODULE.remove_temporary_environment(session)
+                self.assertTrue(session.root.exists())
+                self.assertEqual(protected.read_text(encoding="utf-8"), "keep me")
+
+    def test_identity_change_is_rejected_without_deleting_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            path = Path(value) / "entry"
+            path.write_text("first", encoding="utf-8")
+            entry = MODULE.CleanupEntry(
+                path=path,
+                identity=os.lstat(path),
+                kind="file",
+            )
+            path.unlink()
+            path.write_text("replacement", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                MODULE.remove_manifest_entry(entry)
+            self.assertEqual(path.read_text(encoding="utf-8"), "replacement")
+
+    def test_read_only_file_inside_owned_session_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            with patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}):
+                session = MODULE.create_temporary_environment()
+                read_only = session.root / "read-only.bin"
+                read_only.write_bytes(b"temporary")
+                read_only.chmod(0o444)
+                MODULE.remove_temporary_environment(session)
+                self.assertFalse(session.root.exists())
+
+    def test_cleanup_never_follows_a_directory_link(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            parent = Path(value)
+            outside = parent / "outside"
+            outside.mkdir()
+            protected = outside / "protected.txt"
+            protected.write_text("keep me", encoding="utf-8")
+            with patch.dict(os.environ, {"SEEDVR2_TEMP_ROOT": value}):
+                session = MODULE.create_temporary_environment()
+                link = session.root / "external-link"
+                if os.name == "nt":
+                    subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(link), str(outside)],
+                        check=True,
+                        capture_output=True,
+                    )
+                else:
+                    link.symlink_to(outside, target_is_directory=True)
+                MODULE.remove_temporary_environment(session)
+
+            self.assertTrue(protected.is_file())
+            self.assertEqual(protected.read_text(encoding="utf-8"), "keep me")
+
+    def test_cleanup_rejects_a_linked_session_root(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            parent = Path(value)
+            outside = parent / "outside"
+            outside.mkdir()
+            protected = outside / "protected.txt"
+            protected.write_text("keep me", encoding="utf-8")
+            linked_root = parent / "seedvr2-batch-linked-root"
+            if os.name == "nt":
+                subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(linked_root), str(outside)],
+                    check=True,
+                    capture_output=True,
+                )
+            else:
+                linked_root.symlink_to(outside, target_is_directory=True)
+
+            session = MODULE.TemporaryEnvironment(
+                cache=linked_root / "runtime",
+                root=linked_root,
+                parent=parent,
+                token="fake-token",
+            )
+            with self.assertRaises(RuntimeError):
+                MODULE.remove_temporary_environment(session)
+            self.assertEqual(protected.read_text(encoding="utf-8"), "keep me")
 
 
 if __name__ == "__main__":

@@ -17,10 +17,13 @@ The wrapper is Windows-first and tuned for an NVIDIA GPU with limited VRAM. It w
 - Reuses the loaded DiT and VAE across every image in a folder batch.
 - Produces PNG files and optionally normalizes them to exact dimensions.
 - Refuses to overwrite existing outputs.
-- Removes partial outputs after a failed run.
+- Generates inside private staging and publishes only validated outputs.
+- Never deletes a user-selected output path, including after a failed run.
 - Deletes its venv, model weights, source tree, package caches, and task caches on success or failure.
 
-The script only removes the uniquely named `seedvr2-batch-*` directory that it created. It does not accept an arbitrary cache or cleanup path. Before deletion it verifies the original resolved parent, rejects symlinks and Windows junctions, and checks a per-run cryptographic ownership marker stored both in memory and inside the session directory.
+The script only removes the uniquely named `seedvr2-batch-*` directory that it created. It does not accept an arbitrary cache or cleanup path. Before deletion it verifies the original resolved parent and a per-run cryptographic ownership marker stored both in memory and inside the session directory. It then atomically renames the directory to an unguessable quarantine name, confirms that the filesystem identity did not change, builds a no-follow deletion manifest, and rechecks every entry's identity immediately before removal. Links and Windows junctions are removed as links and are never traversed.
+
+Cleanup is deliberately fail-closed: if ownership, path containment, filesystem type, mount boundaries, or identity cannot be proven, the script raises an error and leaves the quarantined data in place. It never calls `shutil.rmtree`, never deletes the selected temporary parent, and never treats a matching directory name alone as proof of ownership.
 
 ## Requirements
 
@@ -90,6 +93,8 @@ The following task-owned locations are redirected into the disposable session:
 - SeedVR2 source, venv, models, and dependencies
 
 Normal failures and `Ctrl+C` run cleanup. An abrupt power loss or forced process kill cannot execute Python's `finally` block; in that case, a clearly named `seedvr2-batch-*` directory may remain under the system temp directory or `SEEDVR2_TEMP_ROOT`.
+
+Output files follow an even stricter rule: generated images stay inside the private session until validation succeeds. Publishing uses a new, exclusive temporary file and an atomic no-overwrite operation. The script never removes a final output path. If an unusual filesystem error interrupts publication, it may leave a clearly named `.clean-seedvr2-*.partial` file instead of guessing that deletion is safe.
 
 ## Reproducibility and upstream
 
